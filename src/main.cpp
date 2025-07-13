@@ -1,6 +1,6 @@
 #include <SFML/Graphics.hpp>
 #include <SFML/Graphics/RectangleShape.hpp>
-#include <complex>
+#include <limits>
 #include <cstdint>
 #include <wave_t.hpp>
 #include <vector>
@@ -41,7 +41,7 @@ int main(int argument_count, char** arguments)
         max_sample_float_value = pow(2.0f, 24.0f) - 1.0f; // 2^24 - 1
     }
 
-    if (max_sample_float_value < 1.0f) {
+    if (max_sample_float_value <= std::numeric_limits<float>::epsilon()) {
         std::cout << "Unknown bitrate!! Cannot interpret!!" << std::endl;
         return 1;
     }
@@ -94,10 +94,13 @@ int main(int argument_count, char** arguments)
         size_t sample_count = 0;
         const float delta_x = static_cast<float>(WIDTH) / static_cast<float>((wave_file.sample_size() < MAX_RENDER_SAMPLE_LIMIT) ? wave_file.sample_size() : MAX_RENDER_SAMPLE_LIMIT); 
         for(float x = 0; x < WIDTH; x += delta_x) {
+          if (normalized_samples[x] <= std::numeric_limits<float>::epsilon()) {
+              continue;
+          }
           sf::Vertex line[] =
           {
-              sf::Vertex(sf::Vector2f(x, (normalized_samples[x] * static_cast<float>(HEIGHT))), sf::Color::Green),
-              sf::Vertex(sf::Vector2f(x, HEIGHT), sf::Color::Cyan)
+              sf::Vertex(sf::Vector2f(x, (normalized_samples[x] * static_cast<float>(HEIGHT - 1))), sf::Color::Green),
+              sf::Vertex(sf::Vector2f(x, static_cast<float>(HEIGHT - 1)), sf::Color::Green)
           };
 
           window.draw(line, 2, sf::Lines);
