@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <numbers>
 #include <optional>
@@ -27,6 +28,100 @@ constexpr auto DEFAULT_SUB_CHUNK_1_SIZE = 16;
 constexpr auto DEFAULT_RESERVE_VALUE = 44100 * 60 * 5;
 
 enum wave_type_t : uint8_t { sine = 1, triangle = 2, square = 4, sawtooth = 8 };
+
+// Complex number which will be used by DFT
+struct complex_t {
+  float real_part;
+  float imaginary_part;
+  float magnitude;
+};
+
+void inverse_discrete_fourier_transform_async(
+    size_t sample_size, std::vector<float> &time_domain,
+    const std::vector<complex_t> &frequency_domain) {
+  std::vector<std::future<float>> futures;
+  for (size_t frequency = 0; frequency < sample_size; frequency++) {
+    auto future = std::async(std::launch::async, [&sample_size, frequency,
+                                                  &frequency_domain]() {
+      float real = 0.0f;
+      for (size_t n = 0; n < sample_size; n++) {
+        const float x = frequency_domain[n].magnitude;
+        float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
+        float z =
+            2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
+        real += x * cos(z);
+      }
+      return (real / static_cast<float>(sample_size));
+    });
+    futures.push_back(std::move(future));
+  }
+  for (auto &future : futures) {
+    time_domain.push_back(future.get());
+  }
+}
+
+void inverse_discrete_fourier_transform(
+    size_t sample_size, std::vector<float> &time_domain,
+    const std::vector<complex_t> &frequency_domain) {
+  for (size_t frequency = 0; frequency < sample_size; frequency++) {
+    float real = 0.0f;
+    for (size_t n = 0; n < sample_size; n++) {
+      const float x = frequency_domain[n].magnitude;
+      float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
+      float z = 2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
+      real += x * cos(z);
+    }
+    time_domain.push_back(real / static_cast<float>(sample_size));
+  }
+}
+
+void discrete_fourier_transform(size_t sample_size,
+                                const std::vector<float> &time_domain,
+                                std::vector<complex_t> &frequency_domain) {
+  // O(n^2)
+  for (size_t frequency = 0; frequency < sample_size; frequency++) {
+    complex_t result{0.0f, 0.0f, 0.0f};
+    for (size_t n = 0; n < sample_size; n++) {
+      const float &x = time_domain[n];
+      float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
+      float z = 2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
+      result.real_part += x * cos(z);
+      result.imaginary_part -= x * sin(z);
+    }
+    result.magnitude = std::hypotf(result.real_part, result.imaginary_part);
+    frequency_domain.push_back(result);
+  }
+}
+
+void discrete_fourier_transform_async(
+    size_t sample_size, const std::vector<float> &time_domain,
+    std::vector<complex_t> &frequency_domain) {
+  std::vector<std::future<complex_t>> futures;
+  for (size_t frequency = 0; frequency < sample_size; frequency++) {
+    auto future = std::async(std::launch::async, [&sample_size, &time_domain,
+                                                  frequency]() {
+      complex_t result;
+      result.real_part = 0.0;
+      result.imaginary_part = 0.0;
+      result.magnitude = 0.0;
+      for (size_t n = 0; n < sample_size; n++) {
+        const float &x = time_domain[n];
+        const float ratio =
+            (static_cast<float>(n) / static_cast<float>(sample_size));
+        const float z =
+            2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
+        result.real_part += x * cos(z);
+        result.imaginary_part -= x * sin(z);
+      }
+      result.magnitude = std::hypotf(result.real_part, result.imaginary_part);
+      return result;
+    });
+    futures.push_back(std::move(future));
+  }
+  for (auto &future : futures) {
+    frequency_domain.push_back(future.get());
+  }
+}
 
 struct wave_header_t {
   uint32_t chunk_id;
@@ -57,6 +152,29 @@ public:
     m_samples.reserve(DEFAULT_RESERVE_VALUE);
   }
 
+  // Takes a frequency domain and constructs wave samples for playback --
+  // supports async loading of samples or not
+  explicit wave_file_t(const size_t sample_size,
+                       const std::vector<complex_t> &frequency_domain,
+                       bool async = true)
+      : wave_file_t() {
+    std::vector<float> time_domain;
+    if (sample_size > DEFAULT_RESERVE_VALUE) {
+      m_samples.reserve(sample_size);
+    }
+    time_domain.reserve(sample_size);
+    if (async) {
+      inverse_discrete_fourier_transform_async(sample_size, time_domain,
+                                               frequency_domain);
+    } else {
+      inverse_discrete_fourier_transform(sample_size, time_domain,
+                                         frequency_domain);
+    }
+    for (auto &time_domain_sample : time_domain) {
+      m_samples.push_back(time_domain_sample);
+    }
+  }
+
   wave_file_t(const std::string &wav_file_path) {
     memset(&m_header, 0, sizeof(m_header));
     auto wave_file_handle = fopen(wav_file_path.c_str(), "rb");
@@ -64,7 +182,8 @@ public:
       size_t bytes_read =
           fread(&m_header, sizeof(uint8_t), sizeof(m_header), wave_file_handle);
       if (bytes_read == sizeof(m_header)) {
-        const size_t sample_size = m_header.sub_chunk_2_size / m_header.block_align;
+        const size_t sample_size =
+            m_header.sub_chunk_2_size / m_header.block_align;
         switch (m_header.bits_per_sample) {
         case _8_BITS_PER_SAMPLE: {
           int8_t *samples = new int8_t[sample_size];
@@ -100,12 +219,14 @@ public:
   }
 
   operator bool() {
-      return m_header.chunk_id == RIFF_ASCII 
-                  && m_header.format == WAVE_ASCII && m_header.sub_chunk_1_id == FMT_ASCII
-                  && m_header.sub_chunk_2_id == DATA_ASCII && (m_header.audio_format != 0)
-                  && (m_header.bits_per_sample > 0) && (m_header.number_of_channels > 0)
-                  && (m_header.sample_rate > 0) && (m_header.byte_rate > 0) && (m_header.chunk_size > 0)
-                  && (m_header.sub_chunk_1_size == DEFAULT_SUB_CHUNK_1_SIZE) && (m_header.sub_chunk_2_size > 0);
+    return m_header.chunk_id == RIFF_ASCII && m_header.format == WAVE_ASCII &&
+           m_header.sub_chunk_1_id == FMT_ASCII &&
+           m_header.sub_chunk_2_id == DATA_ASCII &&
+           (m_header.audio_format != 0) && (m_header.bits_per_sample > 0) &&
+           (m_header.number_of_channels > 0) && (m_header.sample_rate > 0) &&
+           (m_header.byte_rate > 0) && (m_header.chunk_size > 0) &&
+           (m_header.sub_chunk_1_size == DEFAULT_SUB_CHUNK_1_SIZE) &&
+           (m_header.sub_chunk_2_size > 0);
   }
 
   std::optional<uint32_t> operator[](size_t index) const {
@@ -212,7 +333,7 @@ public:
                        double phase) {
       return static_cast<int16_t>(
           amplititude *
-          sin((2 * std::numbers::pi * _frequency * time) + phase));
+          sin((2.0 * std::numbers::pi * _frequency * time) + phase));
     };
 
     // Source: https://en.wikipedia.org/wiki/Triangle_wave
@@ -220,7 +341,7 @@ public:
       const double period = (1.0 / _frequency);
       return static_cast<int16_t>(
           fabs(((2.0 * amplititude) / std::numbers::pi) *
-               asin(sin(2 * time * (std::numbers::pi / period)))));
+               asin(sin(2.0 * time * (std::numbers::pi / period)))));
     };
 
     // Source: https://en.wikipedia.org/wiki/Square_wave_(waveform)
@@ -319,6 +440,22 @@ public:
     }
   }
 
+  std::vector<complex_t> get_frequency_domain(size_t sample_size, bool async) {
+    std::vector<complex_t> frequency_domain;
+    std::vector<float> time_domain;
+    time_domain.reserve(m_samples.size());
+    for (auto &sample : m_samples) {
+      time_domain.push_back(static_cast<double>(sample));
+    }
+    if (async) {
+      discrete_fourier_transform_async(sample_size, time_domain,
+                                       frequency_domain);
+    } else {
+      discrete_fourier_transform(sample_size, time_domain, frequency_domain);
+    }
+    return frequency_domain;
+  }
+
 #ifdef DEBUG
 
   std::string get_readable_wave_header(void) {
@@ -339,8 +476,8 @@ public:
     header << "byte_rate=" << m_header.byte_rate << std::endl;
     header << "block_align=" << m_header.block_align << std::endl;
     header << "bits_per_sample=" << m_header.bits_per_sample << std::endl;
-    header << "sub_chunk_2_id=0x" << std::hex << std::byteswap(m_header.sub_chunk_2_id)
-           << std::endl;
+    header << "sub_chunk_2_id=0x" << std::hex
+           << std::byteswap(m_header.sub_chunk_2_id) << std::endl;
     header << "sub_chunk_2_size=" << std::dec << m_header.sub_chunk_2_size
            << std::endl;
     return header.str();
