@@ -1,5 +1,6 @@
 #include <SFML/Graphics.hpp>
 #include <SFML/Graphics/RectangleShape.hpp>
+#include <SFML/Window/Keyboard.hpp>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -21,8 +22,9 @@ constexpr size_t MAX_RENDER_SAMPLE_LIMIT = 4000000;
 constexpr auto FONT_FILE = "/GohuFontuni14NerdFont-Regular.ttf";
 
 struct fundamental_frequency_future_result { // Yes its really long :p
-  std::unique_ptr<std::vector<complex_t>> frequency_domain;
+  std::unique_ptr<std::vector<std::complex<float>>> frequency_domain;
   float fundamental_frequency;
+  size_t dft_bin_index;
 };
 
 int main(int argument_count, char **arguments) {
@@ -53,15 +55,17 @@ int main(int argument_count, char **arguments) {
             auto frequency_domain_result =
                 wave_file.get_frequency_domain(dft_sample_size, async);
             fundamental_frequency_future_result result;
-            result.frequency_domain = std::make_unique<std::vector<complex_t>>(
+            result.frequency_domain = std::make_unique<std::vector<std::complex<float>>>(
                 std::move(frequency_domain_result));
             result.fundamental_frequency = 0.0f;
+            result.dft_bin_index = 0;
             double max = std::numeric_limits<float>::min();
             for (size_t frequency = 0;
                  frequency < result.frequency_domain->size(); frequency++) {
               float magnitude =
-                  result.frequency_domain->at(frequency).magnitude;
+                  std::norm(result.frequency_domain->at(frequency));
               if (magnitude >= max) {
+                result.dft_bin_index = frequency;
                 result.fundamental_frequency = static_cast<float>(frequency);
                 max = magnitude;
               }
@@ -117,19 +121,26 @@ int main(int argument_count, char **arguments) {
   sf::RenderWindow window(sf::VideoMode({WIDTH, HEIGHT}),
                           title_window_sstream.str());
 
-  bool ready = (std::future_status::ready ==
-                fundamental_frequency_future.wait_for(3ms));
+  bool ready =
+      (std::future_status::ready == fundamental_frequency_future.wait_for(3ms));
 
   std::optional<fundamental_frequency_future_result> dft_result{std::nullopt};
   if (ready) {
     dft_result = fundamental_frequency_future.get();
   }
 
+  std::optional<std::vector<float>> normalized_dft_samples{std::nullopt};
   bool display_time_domain = true;
-
+  
   while (window.isOpen()) {
+
     sf::Event event;
     while (window.pollEvent(event)) {
+      if(event.type == sf::Event::KeyPressed) {
+          if(event.key.code == sf::Keyboard::F12) {
+              display_time_domain = !display_time_domain;
+          }
+      }
       if (event.type == sf::Event::Closed) {
         window.close();
       }
@@ -168,17 +179,32 @@ int main(int argument_count, char **arguments) {
                                ? wave_file.sample_size()
                                : MAX_RENDER_SAMPLE_LIMIT);
     for (float x = 0; x < WIDTH; x += delta_x) {
-      if (normalized_samples[x] <= std::numeric_limits<float>::epsilon()) {
+      if (display_time_domain &&
+          normalized_samples[x] <= std::numeric_limits<float>::epsilon()) {
         continue;
       }
-      sf::Vertex line[] = {
-          sf::Vertex(sf::Vector2f(x, (normalized_samples[x] *
-                                      static_cast<float>(HEIGHT - 1))),
-                     sf::Color::Green),
-          sf::Vertex(sf::Vector2f(x, static_cast<float>(HEIGHT - 1)),
-                     sf::Color::Green)};
 
-      window.draw(line, 2, sf::Lines);
+      if (display_time_domain) {
+        sf::Vertex line[] = {
+            sf::Vertex(sf::Vector2f(x, (normalized_samples[x] *
+                                        static_cast<float>(HEIGHT - 1))),
+                       sf::Color::Green),
+            sf::Vertex(sf::Vector2f(x, static_cast<float>(HEIGHT - 1)),
+                       sf::Color::Green)};
+
+        window.draw(line, 2, sf::Lines);
+      } else {
+        const float normalized_sample =
+            (1.0f - (fmodf(std::norm(dft_result->frequency_domain->at(x)), max_sample_float_value) /
+                    max_sample_float_value));
+        sf::Vertex line[] = {
+            sf::Vertex(sf::Vector2f(x, (normalized_sample *
+                                        static_cast<float>(HEIGHT - 1))),
+                       sf::Color::Green),
+            sf::Vertex(sf::Vector2f(x, static_cast<float>(HEIGHT - 1)),
+                       sf::Color::Green)};
+        window.draw(line, 2, sf::Lines);
+      }
 
       if (sample_count++ >= MAX_RENDER_SAMPLE_LIMIT) {
         break;
@@ -189,10 +215,10 @@ int main(int argument_count, char **arguments) {
       window.display(); // We don't want to get the future result anymore.
       continue;
     }
-
+    
     ready = (std::future_status::ready ==
              fundamental_frequency_future.wait_for(3ms));
-
+ 
     if (ready) {
       dft_result = fundamental_frequency_future.get();
     }

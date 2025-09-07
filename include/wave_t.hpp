@@ -3,9 +3,11 @@
 
 #include <bit>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <limits>
@@ -27,25 +29,73 @@ constexpr auto _24_BITS_PER_SAMPLE = 24;
 constexpr auto DEFAULT_SUB_CHUNK_1_SIZE = 16;
 constexpr auto DEFAULT_RESERVE_VALUE = 44100 * 60 * 5;
 
-enum wave_type_t : uint8_t { sine = 1, triangle = 2, square = 4, sawtooth = 8 };
+enum wave_type_t : uint8_t { invalid = 0, sine = 1, triangle = 2, square = 4, sawtooth = 8 };
 
-// Complex number which will be used by DFT
-struct complex_t {
-  float real_part;
-  float imaginary_part;
-  float magnitude;
+// Provides functions that generate signals and dft and invesre dft function
+namespace helper {
+
+constexpr double set_volume(double percent) {
+  if (percent > 1.0) {
+    percent = 1.0;
+  }
+  if (percent < 0.0) {
+    percent = 0.0;
+  }
+  return static_cast<double>(INT16_MAX - 1) * percent;
+}
+
+// Source: https://en.wikipedia.org/wiki/Sign_function
+constexpr double sign(double x) {
+  if (x > 0) {
+    return 1.0;
+  } else if (x < 0) {
+    return -1.0;
+  } else {
+    return 0.0;
+  }
+}
+
+// Source: https://en.wikipedia.org/wiki/Sine_wave
+constexpr int16_t pcm_sine(double frequency, double time, double amplititude,
+                           double phase) {
+  return static_cast<int16_t>(
+      amplititude * sin((2.0 * std::numbers::pi * frequency * time) + phase));
+}
+
+// Source: https://en.wikipedia.org/wiki/Triangle_wave
+constexpr int16_t pcm_triangle(double time, double amplititude,
+                               double frequency) {
+  const double period = (1.0 / frequency);
+  return static_cast<int16_t>(
+      fabs(((2.0 * amplititude) / std::numbers::pi) *
+           asin(sin(2.0 * time * (std::numbers::pi / period)))));
 };
+
+// Source: https://en.wikipedia.org/wiki/Square_wave_(waveform)
+constexpr int16_t pcm_square(double time, double amplititude,
+                             double frequency) {
+  return static_cast<int16_t>(
+      amplititude * sign(sin(2 * std::numbers::pi * frequency * time)));
+}
+
+// Source: https://en.wikipedia.org/wiki/Sawtooth_wave
+constexpr int16_t pcm_saw_tooth(double time, double amplititude,
+                                double frequency) {
+  const double period = (1.0 / frequency);
+  return static_cast<int16_t>(2.0 * amplititude *
+                              ((time / period) - floor(0.5 + (time / period))));
+}
 
 void inverse_discrete_fourier_transform_async(
     size_t sample_size, std::vector<float> &time_domain,
-    const std::vector<complex_t> &frequency_domain) {
+    const std::vector<std::complex<float>> &frequency_domain) {
   std::vector<std::future<float>> futures;
   for (size_t frequency = 0; frequency < sample_size; frequency++) {
     auto future = std::async(std::launch::async, [&sample_size, frequency,
                                                   &frequency_domain]() {
       float real = 0.0f;
       for (size_t n = 0; n < sample_size; n++) {
-        const float x = frequency_domain[n].magnitude;
+        const float x = std::norm(frequency_domain[n]);
         float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
         float z =
             2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
@@ -62,11 +112,11 @@ void inverse_discrete_fourier_transform_async(
 
 void inverse_discrete_fourier_transform(
     size_t sample_size, std::vector<float> &time_domain,
-    const std::vector<complex_t> &frequency_domain) {
+    const std::vector<std::complex<float>> &frequency_domain) {
   for (size_t frequency = 0; frequency < sample_size; frequency++) {
     float real = 0.0f;
     for (size_t n = 0; n < sample_size; n++) {
-      const float x = frequency_domain[n].magnitude;
+      const float x = std::norm(frequency_domain[n]);
       float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
       float z = 2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
       real += x * cos(z);
@@ -75,53 +125,48 @@ void inverse_discrete_fourier_transform(
   }
 }
 
-void discrete_fourier_transform(size_t sample_size,
-                                const std::vector<float> &time_domain,
-                                std::vector<complex_t> &frequency_domain) {
+void discrete_fourier_transform(
+    size_t sample_size, const std::vector<float> &time_domain,
+    std::vector<std::complex<float>> &frequency_domain) {
   // O(n^2)
   for (size_t frequency = 0; frequency < sample_size; frequency++) {
-    complex_t result{0.0f, 0.0f, 0.0f};
+    std::complex<float> result = 0.0f + 0.0if;
     for (size_t n = 0; n < sample_size; n++) {
       const float &x = time_domain[n];
       float ratio = (static_cast<float>(n) / static_cast<float>(sample_size));
       float z = 2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
-      result.real_part += x * cos(z);
-      result.imaginary_part -= x * sin(z);
+      result += std::complex<float>((x * cos(z)), -(x * sin(z)));
     }
-    result.magnitude = std::hypotf(result.real_part, result.imaginary_part);
     frequency_domain.push_back(result);
   }
 }
 
 void discrete_fourier_transform_async(
     size_t sample_size, const std::vector<float> &time_domain,
-    std::vector<complex_t> &frequency_domain) {
-  std::vector<std::future<complex_t>> futures;
+    std::vector<std::complex<float>> &frequency_domain) {
+  std::vector<std::future<std::complex<float>>> futures;
   for (size_t frequency = 0; frequency < sample_size; frequency++) {
-    auto future = std::async(std::launch::async, [&sample_size, &time_domain,
-                                                  frequency]() {
-      complex_t result;
-      result.real_part = 0.0;
-      result.imaginary_part = 0.0;
-      result.magnitude = 0.0;
-      for (size_t n = 0; n < sample_size; n++) {
-        const float &x = time_domain[n];
-        const float ratio =
-            (static_cast<float>(n) / static_cast<float>(sample_size));
-        const float z =
-            2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
-        result.real_part += x * cos(z);
-        result.imaginary_part -= x * sin(z);
-      }
-      result.magnitude = std::hypotf(result.real_part, result.imaginary_part);
-      return result;
-    });
+    auto future = std::async(
+        std::launch::async, [&sample_size, &time_domain, frequency]() {
+          std::complex<float> result = 0.0f + 0.0if;
+          for (size_t n = 0; n < sample_size; n++) {
+            const float &x = time_domain[n];
+            const float ratio =
+                (static_cast<float>(n) / static_cast<float>(sample_size));
+            const float z =
+                2.0 * std::numbers::pi * static_cast<float>(frequency) * ratio;
+            result += std::complex<float>((x * cos(z)), -(x * sin(z)));
+          }
+          return result;
+        });
     futures.push_back(std::move(future));
   }
   for (auto &future : futures) {
     frequency_domain.push_back(future.get());
   }
 }
+
+} // namespace helper
 
 struct wave_header_t {
   uint32_t chunk_id;
@@ -141,6 +186,29 @@ struct wave_header_t {
 
 class wave_file_t {
 public:
+  enum oscillator_type_t : uint8_t { empty = 0, carrier = 1, modulation = 2 };
+  struct oscillator_config_t {
+    oscillator_type_t operator_type;
+    uint8_t
+        wave_type; // Can be a combination of multiple waves so this oscilator
+                   // can be already a saw and sqaure for example
+    double frequency;
+    const oscillator_config_t
+        *carrier_to_modulate; // Null if oscillator is carrier and not modulator
+  };
+  struct synth_config_t {
+    oscillator_config_t oscillator_a;
+    oscillator_config_t oscillator_b;
+    oscillator_config_t oscillator_c;
+    oscillator_config_t oscillator_d;
+    bool empty(void) const {
+      return oscillator_a.operator_type == oscillator_type_t::empty &&
+             oscillator_b.operator_type == oscillator_type_t::empty &&
+             oscillator_c.operator_type == oscillator_type_t::empty &&
+             oscillator_d.operator_type == oscillator_type_t::empty;
+    }
+  };
+
   wave_file_t(void) {
     memset(&m_header, 0, sizeof(m_header));
     m_header.chunk_id = RIFF_ASCII;
@@ -155,7 +223,7 @@ public:
   // Takes a frequency domain and constructs wave samples for playback --
   // supports async loading of samples or not
   explicit wave_file_t(const size_t sample_size,
-                       const std::vector<complex_t> &frequency_domain,
+                       const std::vector<std::complex<float>> &frequency_domain,
                        bool async = true)
       : wave_file_t() {
     std::vector<float> time_domain;
@@ -164,11 +232,11 @@ public:
     }
     time_domain.reserve(sample_size);
     if (async) {
-      inverse_discrete_fourier_transform_async(sample_size, time_domain,
-                                               frequency_domain);
+      helper::inverse_discrete_fourier_transform_async(sample_size, time_domain,
+                                                       frequency_domain);
     } else {
-      inverse_discrete_fourier_transform(sample_size, time_domain,
-                                         frequency_domain);
+      helper::inverse_discrete_fourier_transform(sample_size, time_domain,
+                                                 frequency_domain);
     }
     for (auto &time_domain_sample : time_domain) {
       m_samples.push_back(time_domain_sample);
@@ -300,6 +368,156 @@ public:
     return true;
   }
 
+  bool generate_synth(size_t sample_size, double volume_percent,
+                      wave_file_t::synth_config_t &configuration) {
+
+    if (m_header.sample_rate == 0) {
+      return false;
+    }
+
+    if (configuration.empty()) {
+      return false;
+    }
+
+    const double volume = helper::set_volume(volume_percent);
+
+    const bool is_stereo = m_header.number_of_channels == 2;
+
+    std::vector<uint32_t> output;
+
+    std::vector<const oscillator_config_t *> carrier_oscialltors{};
+
+    uint8_t modulating_wave_type{};
+
+    double* frequency = nullptr;
+    double modulating_frequency{};
+
+    if (configuration.oscillator_a.operator_type !=
+        oscillator_type_t::modulation) {
+      carrier_oscialltors.push_back(
+          &configuration
+               .oscillator_a); // NOTES: As long as they share the same lifetime
+                               // this is safe but we should try to use an
+                               // std::optional in the future
+        frequency = &configuration.oscillator_a.frequency;
+    } else {
+      modulating_wave_type = configuration.oscillator_a.wave_type;
+      modulating_frequency = configuration.oscillator_a.frequency;
+    }
+
+    if (configuration.oscillator_b.operator_type !=
+        oscillator_type_t::modulation) {
+      carrier_oscialltors.push_back(
+          &configuration
+               .oscillator_b); // NOTES: As long as they share the same lifetime
+                               // this is safe but we should try to use an
+                               // std::optional in the future
+      if (nullptr == frequency) {
+        frequency = &configuration.oscillator_b.frequency;
+      }
+    } else if (wave_type_t::invalid == modulating_wave_type) {
+      modulating_wave_type = configuration.oscillator_b.wave_type;
+      modulating_frequency = configuration.oscillator_b.frequency;
+    }
+
+    if (configuration.oscillator_c.operator_type !=
+        oscillator_type_t::modulation) {
+      carrier_oscialltors.push_back(
+          &configuration
+               .oscillator_c); // NOTES: As long as they share the same lifetime
+                               // this is safe but we should try to use an
+                               // std::optional in the future
+      if (nullptr == frequency) {
+        frequency = &configuration.oscillator_c.frequency;
+      }
+    } else if (wave_type_t::invalid == modulating_wave_type) {
+      modulating_wave_type = configuration.oscillator_c.wave_type;
+      modulating_frequency = configuration.oscillator_c.frequency;   
+    }
+
+    if (configuration.oscillator_d.operator_type !=
+        oscillator_type_t::modulation) {
+      carrier_oscialltors.push_back(
+          &configuration
+               .oscillator_d); // NOTES: As long as they share the same lifetime
+                               // this is safe but we should try to use an
+                               // std::optional in the future
+      if (nullptr == frequency) {
+        frequency = &configuration.oscillator_d.frequency;
+      }
+    } else if (wave_type_t::invalid == modulating_wave_type) {
+      modulating_wave_type = configuration.oscillator_d.wave_type;
+      modulating_frequency = configuration.oscillator_d.frequency;
+    }
+
+    if (nullptr == frequency) {
+      return false;
+    }
+
+    if (carrier_oscialltors.empty()) {
+      return false; // Something is wrong -- no carrier means no music :(
+    }
+
+    auto carrier_oscilltor = carrier_oscialltors.front();
+    const auto& wave_type = carrier_oscilltor->wave_type;
+    const double phase{};
+    double time{};
+    for (size_t _{}; _ < sample_size; _++) {
+      int16_t sample{};
+      double frequency_offset = 0.0; 
+      if ((modulating_wave_type & wave_type_t::sine)) {
+        frequency_offset += helper::pcm_sine(modulating_frequency, time, volume, phase);
+      }
+      if ((modulating_wave_type & wave_type_t::triangle)) {
+        frequency_offset += helper::pcm_triangle(time, volume, modulating_frequency);
+      }
+      if ((modulating_wave_type & wave_type_t::square)) {
+        frequency_offset += helper::pcm_square(time, volume, modulating_frequency);
+      }
+      if ((modulating_wave_type & wave_type_t::sawtooth)) {
+        frequency_offset += helper::pcm_saw_tooth(time, volume, modulating_frequency);
+      }
+
+      frequency_offset /= volume;
+      frequency_offset *= std::numbers::pi;
+      
+      if ((wave_type & wave_type_t::sine)) {
+        sample += helper::pcm_sine(*frequency + frequency_offset, time, volume, phase);
+      }
+      if ((wave_type & wave_type_t::triangle)) {
+        sample += helper::pcm_triangle(time, volume, *frequency + frequency_offset);
+      }
+      if ((wave_type & wave_type_t::square)) {
+        sample += helper::pcm_square(time, volume, *frequency + frequency_offset);
+      }
+      if ((wave_type & wave_type_t::sawtooth)) {
+        sample += helper::pcm_saw_tooth(time, volume, *frequency + frequency_offset);
+      }
+      
+
+      switch (m_header.bits_per_sample) {
+      case _8_BITS_PER_SAMPLE:
+        !is_stereo ? add_8_bits_sample(sample)
+                   : add_8_bits_sample(sample, sample);
+        break;
+      case _16_BITS_PER_SAMPLE:
+        !is_stereo ? add_16_bits_sample(sample)
+                   : add_16_bits_sample(sample, sample);
+        break;
+      case _24_BITS_PER_SAMPLE:
+        !is_stereo ? add_24_bits_sample(sample)
+                   : add_16_bits_sample(sample, sample);
+        break;
+      default:
+        break;
+      }
+
+      time += (1.0 / static_cast<double>(m_header.sample_rate));
+    }
+
+    return true;
+  }
+
   bool generate_wave(uint8_t wave_type, size_t sample_size, double frequency,
                      double volume_percent) {
 
@@ -307,64 +525,11 @@ public:
       return false;
     }
 
-    auto set_volume = [](double percent) {
-      if (percent > 1.0) {
-        percent = 1.0;
-      }
-      if (percent < 0.0) {
-        percent = 0.0;
-      }
-      return static_cast<double>(INT16_MAX - 1) * percent;
-    };
+    const bool is_stereo = m_header.number_of_channels == 2;
+    const double phase{};
+    double time{};
 
-    // Source: https://en.wikipedia.org/wiki/Sign_function
-    auto sign = [](double x) {
-      if (x > 0) {
-        return 1.0;
-      } else if (x < 0) {
-        return -1.0;
-      } else {
-        return 0.0;
-      }
-    };
-
-    // Source: https://en.wikipedia.org/wiki/Sine_wave
-    auto pcm_sine = [](double _frequency, double time, double amplititude,
-                       double phase) {
-      return static_cast<int16_t>(
-          amplititude *
-          sin((2.0 * std::numbers::pi * _frequency * time) + phase));
-    };
-
-    // Source: https://en.wikipedia.org/wiki/Triangle_wave
-    auto pcm_triangle = [](double time, double amplititude, double _frequency) {
-      const double period = (1.0 / _frequency);
-      return static_cast<int16_t>(
-          fabs(((2.0 * amplititude) / std::numbers::pi) *
-               asin(sin(2.0 * time * (std::numbers::pi / period)))));
-    };
-
-    // Source: https://en.wikipedia.org/wiki/Square_wave_(waveform)
-    auto pcm_square = [sign](double time, double amplititude,
-                             double _frequency) {
-      return static_cast<int16_t>(
-          amplititude * sign(sin(2 * std::numbers::pi * _frequency * time)));
-    };
-
-    // Source: https://en.wikipedia.org/wiki/Sawtooth_wave
-    auto pcm_saw_tooth = [](double time, double amplititude,
-                            double _frequency) {
-      const double period = (1.0 / _frequency);
-      return static_cast<int16_t>(
-          2.0 * amplititude * ((time / period) - floor(0.5 + (time / period))));
-    };
-
-    bool is_stereo = m_header.number_of_channels == 2;
-    const double phase = 0.0;
-    double time = 0.0;
-    size_t sample_count = 0;
-    for (size_t _ = 0; _ < sample_size; _++) {
-      size_t wave_count =
+    size_t wave_count =
           static_cast<size_t>((wave_type & wave_type_t::sine) ==
                               (wave_type_t::sine)) +
           static_cast<size_t>((wave_type & wave_type_t::triangle) ==
@@ -373,25 +538,22 @@ public:
                               (wave_type_t::square)) +
           static_cast<size_t>((wave_type & wave_type_t::sawtooth) ==
                               (wave_type_t::sawtooth));
-      const double volume =
-          set_volume(volume_percent / static_cast<double>(wave_count));
-      int16_t sample = 0;
+
+    const double volume = helper::set_volume(volume_percent / static_cast<double>(wave_count));
+
+    for (size_t _ = 0ul; _ < sample_size; _++) {  
+      int16_t sample{};
       if ((wave_type & wave_type_t::sine)) {
-        sample += pcm_sine(frequency, time, volume, phase);
-        if (sample_count >=
-            static_cast<size_t>(static_cast<double>(m_header.sample_rate))) {
-          sample_count = 0;
-        }
-        sample_count++;
+        sample += helper::pcm_sine(frequency, time, volume, phase);
       }
       if ((wave_type & wave_type_t::triangle)) {
-        sample += pcm_triangle(time, volume, frequency);
+        sample += helper::pcm_triangle(time, volume, frequency);
       }
       if ((wave_type & wave_type_t::square)) {
-        sample += pcm_square(time, volume, frequency);
+        sample += helper::pcm_square(time, volume, frequency);
       }
       if ((wave_type & wave_type_t::sawtooth)) {
-        sample += pcm_saw_tooth(time, volume, frequency);
+        sample += helper::pcm_saw_tooth(time, volume, frequency);
       }
       switch (m_header.bits_per_sample) {
       case _8_BITS_PER_SAMPLE:
@@ -440,18 +602,20 @@ public:
     }
   }
 
-  std::vector<complex_t> get_frequency_domain(size_t sample_size, bool async) {
-    std::vector<complex_t> frequency_domain;
+  std::vector<std::complex<float>> get_frequency_domain(size_t sample_size,
+                                                        bool async) {
+    std::vector<std::complex<float>> frequency_domain;
     std::vector<float> time_domain;
     time_domain.reserve(m_samples.size());
     for (auto &sample : m_samples) {
       time_domain.push_back(static_cast<double>(sample));
     }
     if (async) {
-      discrete_fourier_transform_async(sample_size, time_domain,
-                                       frequency_domain);
+      helper::discrete_fourier_transform_async(sample_size, time_domain,
+                                               frequency_domain);
     } else {
-      discrete_fourier_transform(sample_size, time_domain, frequency_domain);
+      helper::discrete_fourier_transform(sample_size, time_domain,
+                                         frequency_domain);
     }
     return frequency_domain;
   }
